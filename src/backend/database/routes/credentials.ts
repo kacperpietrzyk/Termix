@@ -5,6 +5,10 @@ import { authLogger } from "../../utils/logger.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { parseSSHKey } from "../../utils/ssh-key-utils.js";
+import {
+  isSecretReference,
+  parseSecretReference,
+} from "../../utils/onepassword-connect.js";
 import { registerCredentialKeyRoutes } from "./credential-key-routes.js";
 import { registerCredentialDeployRoutes } from "./credential-deploy-routes.js";
 import { registerCredentialBulkRoutes } from "./credential-bulk-routes.js";
@@ -27,6 +31,21 @@ const router = express.Router();
 
 function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
+}
+
+function isValidKeyReference(value: string): boolean {
+  try {
+    const ref = parseSecretReference(value);
+    return (
+      !!ref &&
+      [ref.vault, ref.item, ref.field].every(
+        (part) => part.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(part),
+      )
+    );
+  } catch {
+    // Invalid percent escapes are not valid Connect references.
+    return false;
+  }
 }
 
 const authManager = AuthManager.getInstance();
@@ -153,8 +172,12 @@ router.post(
 
       let keyInfo = null;
       if (authType === "key" && plainKey) {
-        keyInfo = parseSSHKey(plainKey, plainKeyPassword);
-        if (!keyInfo.success) {
+        const keyReference = isSecretReference(plainKey);
+        if (keyReference && !isValidKeyReference(plainKey)) {
+          return res.status(400).json({ error: "Invalid SSH key reference" });
+        }
+        if (!keyReference) keyInfo = parseSSHKey(plainKey, plainKeyPassword);
+        if (keyInfo && !keyInfo.success) {
           authLogger.warn("SSH key parsing failed", {
             operation: "credential_create",
             userId,
@@ -490,8 +513,12 @@ router.post(
 
       let keyInfo = null;
       if (authType === "key" && plainKey) {
-        keyInfo = parseSSHKey(plainKey, plainKeyPassword);
-        if (!keyInfo.success) {
+        const keyReference = isSecretReference(plainKey);
+        if (keyReference && !isValidKeyReference(plainKey)) {
+          return res.status(400).json({ error: "Invalid SSH key reference" });
+        }
+        if (!keyReference) keyInfo = parseSSHKey(plainKey, plainKeyPassword);
+        if (keyInfo && !keyInfo.success) {
           return res.status(400).json({
             error: keyInfo.error
               ? `Invalid SSH key: ${keyInfo.error}`
@@ -670,9 +697,18 @@ router.put(
       if (updateData.key !== undefined) {
         updateFields.key = updateData.key || null;
 
-        if (updateData.key && existingCredential.authType === "key") {
-          const keyInfo = parseSSHKey(updateData.key, updateData.keyPassword);
-          if (!keyInfo.success) {
+        if (
+          updateData.key &&
+          (updateData.authType ?? existingCredential.authType) === "key"
+        ) {
+          const keyReference = isSecretReference(updateData.key);
+          if (keyReference && !isValidKeyReference(updateData.key)) {
+            return res.status(400).json({ error: "Invalid SSH key reference" });
+          }
+          const keyInfo = keyReference
+            ? null
+            : parseSSHKey(updateData.key, updateData.keyPassword);
+          if (keyInfo && !keyInfo.success) {
             authLogger.warn("SSH key parsing failed during update", {
               operation: "credential_update",
               userId,
@@ -685,9 +721,9 @@ router.put(
                 : "Unrecognized SSH key format. Use an OpenSSH, PEM, or PuTTY PPK v2 RSA/DSA private key.",
             });
           }
-          updateFields.privateKey = keyInfo.privateKey;
-          updateFields.publicKey = keyInfo.publicKey;
-          updateFields.detectedKeyType = keyInfo.keyType;
+          updateFields.privateKey = keyInfo?.privateKey ?? updateData.key;
+          updateFields.publicKey = keyInfo?.publicKey ?? null;
+          updateFields.detectedKeyType = keyInfo?.keyType ?? null;
         }
       }
       if (updateData.keyPassword !== undefined) {
